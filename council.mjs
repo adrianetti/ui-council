@@ -7,7 +7,7 @@
 // - tally:   pass rules, regression detection, and the NEXT step
 // Run it from the project root. All state lives in ./council.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join, resolve, relative, extname, basename } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -162,6 +162,8 @@ const CONFIG_TEMPLATE = {
   exam: DEFAULT_EXAM,
   judges: ['codex', 'claude', 'agy'],
   models: { codex: null, agy: AGY_MODEL, gemini: null },
+  // Reasoning effort per judge. `models --apply` sets the best model and effort available now.
+  efforts: { codex: null, agy: null, claude: null },
 };
 
 // ---------- helpers ----------
@@ -191,6 +193,7 @@ function loadConfig() {
     checks: { ...DEFAULT_CHECKS, ...file.checks },
     exam: { ...DEFAULT_EXAM, ...file.exam },
     models: { ...CONFIG_TEMPLATE.models, ...file.models },
+    efforts: { ...CONFIG_TEMPLATE.efforts, ...file.efforts },
   };
 }
 
@@ -226,6 +229,7 @@ function tasteHash(cfg) {
   h.update(style());
   h.update(notes());
   h.update(JSON.stringify(cfg.models));
+  if (Object.values(cfg.efforts ?? {}).some((v) => v != null)) h.update(JSON.stringify(cfg.efforts));
   return h.digest('hex').slice(0, 16);
 }
 
@@ -653,21 +657,80 @@ function stats(scores) {
 
 class FatalError extends Error {}
 
+// Every external judge call appends one line to council/usage.jsonl: tokens and time,
+// so the tally and the gallery can show what each round cost.
+function logUsage(judge, cfg, task, tokens, seconds) {
+  const line = {
+    at: new Date().toISOString(),
+    where: relative(DIR, task.dir) || '.',
+    judge,
+    kind: task.tag,
+    model: cfg.models?.[judge] ?? null,
+    effort: cfg.efforts?.[judge] ?? null,
+    input: tokens?.input ?? null,
+    cached: tokens?.cached ?? null,
+    output: tokens?.output ?? null,
+    reasoning: tokens?.reasoning ?? null,
+    total: tokens ? (tokens.input ?? 0) + (tokens.output ?? 0) : null,
+    seconds: Math.round(seconds ?? 0),
+  };
+  appendFileSync(join(DIR, 'usage.jsonl'), JSON.stringify(line) + '\n');
+}
+
+function readUsage() {
+  const p = join(DIR, 'usage.jsonl');
+  if (!existsSync(p)) return [];
+  return readFileSync(p, 'utf8').split('\n').filter(Boolean).flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// `codex exec --json` prints one event per line. Token counts are on turn.completed.
+function codexEvents(stdout) {
+  return String(stdout).split('\n').flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function codexTokens(events) {
+  const turns = events.filter((e) => e.type === 'turn.completed' && e.usage);
+  if (!turns.length) return null;
+  const sum = (k) => turns.reduce((a, e) => a + (e.usage[k] ?? 0), 0);
+  return { input: sum('input_tokens'), cached: sum('cached_input_tokens'), output: sum('output_tokens'), reasoning: sum('reasoning_output_tokens') };
+}
+
+function codexError(events, stderr) {
+  const failed = events.filter((e) => e.type === 'turn.failed' || e.type === 'error').map((e) => e.error?.message ?? e.message).filter(Boolean);
+  return failed.length ? failed.join(' | ') : tail(stderr);
+}
+
 async function callExternal(judge, cfg, task) {
   const base = join(task.dir, `${judge}.${task.tag}`);
   const rawPath = `${base}.raw.txt`;
   const schemaPath = `${base}.schema.json`;
   writeJson(schemaPath, task.schema);
+  const started = Date.now();
 
   if (judge === 'codex') {
     rmSync(rawPath, { force: true });
-    const args = ['exec', '-s', 'read-only', '--skip-git-repo-check', '--ephemeral', '--output-schema', schemaPath, '-o', rawPath];
+    const args = ['exec', '-s', 'read-only', '--skip-git-repo-check', '--ephemeral', '--json', '--output-schema', schemaPath, '-o', rawPath];
     if (cfg.models?.codex) args.push('-m', cfg.models.codex);
+    if (cfg.efforts?.codex) args.push('-c', `model_reasoning_effort="${cfg.efforts.codex}"`);
     for (const p of task.images) args.push('-i', p);
     // No positional prompt: codex exec reads the prompt from stdin.
     const r = await run('codex', args, { input: task.prompt });
+    const events = codexEvents(r.stdout);
+    logUsage(judge, cfg, task, codexTokens(events), (Date.now() - started) / 1000);
     if (r.timedOut) throw new FatalError('codex timed out');
-    if (!existsSync(rawPath)) throw new FatalError(`codex exited ${r.code}: ${tail(r.stderr || r.stdout)}`);
+    if (!existsSync(rawPath)) throw new FatalError(`codex exited ${r.code}: ${codexError(events, r.stderr)}`);
     return readFileSync(rawPath, 'utf8');
   }
 
@@ -681,6 +744,7 @@ async function callExternal(judge, cfg, task) {
       '--model', cfg.models?.agy ?? AGY_MODEL,
       '--disable-slash-commands',
     ];
+    if (cfg.efforts?.agy) args.push('--effort', cfg.efforts.agy);
     const r = await run('agy', args);
     writeFileSync(rawPath, r.stdout + (r.stderr ? `\n--- stderr ---\n${r.stderr}` : ''));
     if (r.timedOut) throw new FatalError('agy timed out');
@@ -688,8 +752,11 @@ async function callExternal(judge, cfg, task) {
     try {
       wrapper = extractJson(r.stdout);
     } catch {
+      logUsage(judge, cfg, task, null, (Date.now() - started) / 1000);
       throw new FatalError(`agy exited ${r.code}: ${tail(r.stderr || r.stdout)}. If it is not signed in, run \`agy\` once in a terminal.`);
     }
+    const u = wrapper.usage;
+    logUsage(judge, cfg, task, u ? { input: u.input_tokens, cached: u.cache_read_tokens, output: u.output_tokens, reasoning: u.thinking_tokens } : null, wrapper.duration_seconds ?? (Date.now() - started) / 1000);
     if (wrapper.status !== 'SUCCESS' || typeof wrapper.response !== 'string') {
       throw new Error(`agy status ${wrapper.status}: ${tail(wrapper.response ?? r.stderr)}`);
     }
@@ -1164,6 +1231,323 @@ Changes nobody asked for go in "extra" as { "did", "marks" }. Put the commit has
 \`capture ${next}\` refuses to run while any request is "todo", and draws every change, numbered, on rounds/${next}/marked/.`);
 }
 
+// ---------- models and quota ----------
+
+// Talks to `codex app-server` (JSON-RPC over stdio). Listing models and reading the
+// rate limits costs no tokens.
+function codexAppServer(calls, timeoutMs = 30000) {
+  return new Promise((done, fail) => {
+    const child = spawn('codex', ['app-server'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const pending = new Map();
+    let buf = '';
+    let id = 0;
+    const timer = setTimeout(() => {
+      child.kill();
+      fail(new Error('codex app-server did not answer in time'));
+    }, timeoutMs);
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      fail(e);
+    });
+    child.stdout.on('data', (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        let m;
+        try {
+          m = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (m.id != null && pending.has(m.id)) {
+          pending.get(m.id)(m);
+          pending.delete(m.id);
+        }
+      }
+    });
+    child.stdin.on('error', () => {});
+    const call = (method, params) =>
+      new Promise((res) => {
+        const k = ++id;
+        pending.set(k, res);
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: k, method, params }) + '\n');
+      });
+    (async () => {
+      const init = await call('initialize', { clientInfo: { name: 'ui-council', title: 'UI council', version: '1.0.0' } });
+      if (init.error) throw new Error(init.error.message);
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'initialized' }) + '\n');
+      const out = [];
+      for (const [method, params] of calls) {
+        const r = await call(method, params);
+        if (r.error) throw new Error(`${method}: ${r.error.message}`);
+        out.push(r.result);
+      }
+      return out;
+    })()
+      .then((out) => {
+        clearTimeout(timer);
+        child.kill();
+        done(out);
+      })
+      .catch((e) => {
+        clearTimeout(timer);
+        child.kill();
+        fail(e);
+      });
+  });
+}
+
+// The deepest reasoning effort a model offers. "ultra" is skipped: it adds automatic
+// delegation to other agents, which a read-only judge gains nothing from and which costs more.
+const EFFORT_ORDER = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal'];
+const bestEffort = (list) => EFFORT_ORDER.find((e) => list.includes(e)) ?? null;
+const LIGHT = /(^|[-_ ])(flash|lite|mini|nano|spark|small|fast)([-_ ]|$)/i;
+
+function bestCodexModel(models) {
+  const rank = (m) =>
+    (/frontier|most capable|most intelligent|most demanding|smartest/i.test(`${m.description} ${m.displayName}`) ? 4 : 0) +
+    (m.isDefault ? 1 : 0) -
+    (LIGHT.test(m.id) ? 4 : 0);
+  return [...models].sort((a, b) => rank(b) - rank(a))[0] ?? null;
+}
+
+// agy model ids look like gemini-4-argon-high: provider, version, family, effort.
+function bestAgyModel(ids) {
+  const parse = (id) => {
+    const parts = id.split('-');
+    const effort = EFFORT_ORDER.includes(parts.at(-1)) ? parts.at(-1) : null;
+    const version = parseFloat(parts.find((p) => /^\d+(\.\d+)?$/.test(p)) ?? '0');
+    return { id, effort, version, light: LIGHT.test(id) };
+  };
+  const gemini = ids.filter((id) => /^gemini-/.test(id)).map(parse);
+  gemini.sort((a, b) =>
+    (a.light - b.light) ||
+    (b.version - a.version) ||
+    (EFFORT_ORDER.indexOf(a.effort ?? 'minimal') - EFFORT_ORDER.indexOf(b.effort ?? 'minimal')));
+  return gemini[0]?.id ?? null;
+}
+
+async function agyModelIds() {
+  const r = await run('agy', ['models'], { timeoutMs: 60000 });
+  return r.stdout.split('\n').map((l) => l.split('\t')).filter((p) => p.length >= 2 && /^[\w.-]+$/.test(p[0])).map(([id, name]) => ({ id, name: name.trim() }));
+}
+
+async function cmdModels(args) {
+  const cfg = loadConfig();
+  const apply = args.includes('--apply');
+  const ci = args.indexOf('--claude');
+  const claudeModel = ci >= 0 ? args[ci + 1] : null;
+  if (ci >= 0 && !claudeModel) die('--claude needs the model name the Agent tool takes, for example opus.');
+  const best = { models: {}, efforts: {} };
+
+  if (cfg.judges.includes('codex')) {
+    try {
+      const [list] = await codexAppServer([['model/list', {}]]);
+      const models = (list?.data ?? []).filter((m) => !m.hidden);
+      console.log('codex models:');
+      for (const m of models) {
+        const efforts = (m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort);
+        console.log(`  ${m.id.padEnd(22)} ${(m.description ?? '').slice(0, 70)}${m.isDefault ? ' (default)' : ''}\n  ${''.padEnd(22)} efforts: ${efforts.join(', ')}`);
+      }
+      const m = bestCodexModel(models);
+      if (m) {
+        best.models.codex = m.id;
+        best.efforts.codex = bestEffort((m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort));
+      }
+    } catch (e) {
+      console.log(`codex: could not list models (${e.message})`);
+    }
+  }
+  if (cfg.judges.includes('agy')) {
+    const ids = await agyModelIds();
+    console.log(`\nagy models:\n${ids.map((m) => `  ${m.id.padEnd(28)} ${m.name}`).join('\n') || '  none listed. Is agy signed in?'}`);
+    const id = bestAgyModel(ids.map((m) => m.id));
+    // The effort is part of an agy model id, for example gemini-4-argon-high.
+    if (id) best.models.agy = id;
+  }
+  if (claudeModel) {
+    best.models.claude = claudeModel;
+    best.efforts.claude = 'max';
+  }
+
+  const row = (j) => {
+    const now = `${cfg.models?.[j] ?? (j === 'claude' ? 'session model' : 'CLI default')}${cfg.efforts?.[j] ? ` @ ${cfg.efforts[j]}` : ''}`;
+    const want = best.models[j] ? `${best.models[j]}${best.efforts[j] ? ` @ ${best.efforts[j]}` : ''}` : null;
+    return `  ${j.padEnd(8)} now: ${now.padEnd(30)} best: ${want ?? '-'}`;
+  };
+  console.log(`\n${cfg.judges.map(row).join('\n')}`);
+  if (cfg.judges.includes('claude') && !claudeModel) {
+    console.log('  claude: pass --claude <model> with the most capable model the Agent tool offers (for example opus).');
+  }
+  const changed = Object.keys(best.models).some((j) => best.models[j] !== cfg.models?.[j] || (best.efforts[j] ?? null) !== (cfg.efforts?.[j] ?? null));
+  if (!apply) {
+    console.log(changed ? '\nRun `models --apply` to use the best models and efforts.' : '\nThe config already uses the best models listed.');
+    return;
+  }
+  if (!changed) return console.log('\nNothing to change.');
+  const p = join(DIR, 'config.json');
+  const file = readJson(p);
+  file.models = { ...file.models, ...best.models };
+  file.efforts = { ...file.efforts };
+  for (const j of Object.keys(best.models)) file.efforts[j] = best.efforts[j] ?? null;
+  writeJson(p, file);
+  console.log(`\nSaved to ${rel(p)}.${existsSync(join(EXAM_DIR, 'results.json')) ? ' The taste exam is now out of date: retake the judge part.' : ''}`);
+}
+
+const pct = (x) => `${Math.round(x)}%`;
+const when = (iso) => (iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-');
+const windowName = (mins) => (mins >= 10080 ? 'weekly' : mins >= 1440 ? `${Math.round(mins / 1440)}-day` : `${Math.round(mins / 60)}-hour`);
+
+async function codexQuota() {
+  const [res] = await codexAppServer([['account/rateLimits/read', {}]]);
+  const rl = res?.rateLimits ?? {};
+  const buckets = ['primary', 'secondary'].map((k) => rl[k]).filter(Boolean).map((b) => ({
+    name: windowName(b.windowDurationMins),
+    left: 100 - b.usedPercent,
+    resetsAt: b.resetsAt ? new Date(b.resetsAt * 1000).toISOString() : null,
+  }));
+  return { plan: rl.planType ?? null, buckets };
+}
+
+// `agy -p /usage` reports the quota of each model group. Keep the groups this judge's model draws from.
+async function agyQuota(model) {
+  const r = await run('agy', ['-p', '/usage', '--mode', 'plan', '--output-format', 'json', '--print-timeout', '60s'], { timeoutMs: 90000 });
+  const groups = extractJson(r.stdout)?.command?.data?.groups;
+  if (!Array.isArray(groups)) throw new Error(tail(r.stderr || r.stdout));
+  const tokens = new Set(String(model).toLowerCase().split(/[-_.\s]+/));
+  const fits = (name) => {
+    const words = String(name).toLowerCase().split(/\s+/).filter(Boolean);
+    return words.length > 0 && words.every((w) => tokens.has(w));
+  };
+  const listed = (g) => (String(g.description ?? '').split(':')[1] ?? '').split(',');
+  let mine = groups.filter((g) => fits(g.name) || listed(g).some(fits));
+  if (!mine.length) mine = groups;
+  return {
+    plan: null,
+    buckets: mine.flatMap((g) => (g.buckets ?? []).map((b) => ({
+      name: `${g.name} ${b.window}`,
+      left: (b.remaining_fraction ?? 0) * 100,
+      resetsAt: b.reset_time ?? null,
+    }))),
+  };
+}
+
+// --claude "5-hour:14@2026-11-05T20:50Z,weekly:17": percent used per limit, and optionally
+// when it resets, from the app's usage panel or tool.
+function parseClaudeQuota(spec) {
+  const buckets = String(spec).split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const m = s.match(/^(.+?)[:=]\s*(\d+(?:\.\d+)?)%?(?:@(\S+))?$/);
+    if (!m || (m[3] && Number.isNaN(Date.parse(m[3])))) die(`bad --claude value "${s}". Use name:percent-used[@reset-time], for example "5-hour:14@2026-11-05T20:50Z,weekly:17".`);
+    return { name: m[1].trim(), left: 100 - Number(m[2]), resetsAt: m[3] ? new Date(m[3]).toISOString() : null };
+  });
+  return { plan: null, buckets };
+}
+
+function quotaPath(n) {
+  return join(roundDir(n), 'quota.json');
+}
+
+// About how many more rounds each limit allows: the average drop between recorded rounds.
+// A drop only counts within the same window (same reset time, give or take an hour).
+function quotaReport(n, cfg) {
+  const rounds = existsSync(join(DIR, 'rounds'))
+    ? readdirSync(join(DIR, 'rounds')).filter((d) => /^\d+$/.test(d)).map(Number).filter((m) => m <= Number(n)).sort((a, b) => a - b)
+    : [];
+  const snaps = rounds.filter((m) => existsSync(quotaPath(m))).map((m) => ({ m, q: readJson(quotaPath(m)) }));
+  const last = snaps.at(-1);
+  if (!last || last.m !== Number(n)) return null;
+  const sameWindow = (a, b) => !a || !b || Math.abs(new Date(a) - new Date(b)) < 3600 * 1000;
+  const rows = [];
+  for (const [judge, info] of Object.entries(last.q.judges ?? {})) {
+    for (const b of info.buckets ?? []) {
+      const drops = [];
+      for (let i = snaps.length - 1; i > 0 && drops.length < 3; i--) {
+        const cur = snaps[i].q.judges?.[judge]?.buckets?.find((x) => x.name === b.name);
+        const prev = snaps[i - 1].q.judges?.[judge]?.buckets?.find((x) => x.name === b.name);
+        if (!cur || !prev || !sameWindow(cur.resetsAt, prev.resetsAt)) continue;
+        const drop = (prev.left - cur.left) / (snaps[i].m - snaps[i - 1].m);
+        if (drop > 0) drops.push(drop);
+      }
+      const perRound = drops.length ? drops.reduce((a, x) => a + x, 0) / drops.length : null;
+      rows.push({ judge, name: b.name, left: b.left, resetsAt: b.resetsAt, perRound, roundsLeft: perRound ? Math.floor(b.left / perRound) : null });
+    }
+  }
+  const low = rows.filter((r) => r.left < 10 || (r.roundsLeft != null && r.roundsLeft < 2));
+  return { round: last.m, at: last.q.at, rows, low, errors: last.q.errors ?? {} };
+}
+
+function printQuota(report) {
+  console.log(`\nquota left after round ${report.round} (about how many more rounds at the recent rate):`);
+  for (const r of report.rows) {
+    const est = r.roundsLeft != null ? `~${r.roundsLeft} rounds (${r.perRound.toFixed(1)}% a round)` : 'rate not known yet';
+    console.log(`  ${r.judge.padEnd(8)} ${r.name.padEnd(28)} ${pct(r.left).padStart(4)} left  resets ${when(r.resetsAt).padEnd(16)} ${est}`);
+  }
+  for (const [j, e] of Object.entries(report.errors)) console.log(`  ${j.padEnd(8)} could not read: ${e}`);
+}
+
+async function cmdQuota(args) {
+  const cfg = loadConfig();
+  const n = args.find((a) => /^\d+$/.test(a));
+  const ci = args.indexOf('--claude');
+  const snap = { at: new Date().toISOString(), judges: {}, errors: {} };
+  if (n && existsSync(quotaPath(n))) Object.assign(snap.judges, readJson(quotaPath(n)).judges);
+  const jobs = [];
+  if (cfg.judges.includes('codex')) jobs.push(['codex', () => codexQuota()]);
+  if (cfg.judges.includes('agy')) jobs.push(['agy', () => agyQuota(cfg.models?.agy ?? AGY_MODEL)]);
+  await Promise.all(jobs.map(async ([j, f]) => {
+    try {
+      snap.judges[j] = await f();
+    } catch (e) {
+      snap.errors[j] = e.message;
+    }
+  }));
+  if (ci >= 0) snap.judges.claude = parseClaudeQuota(args[ci + 1] ?? '');
+  if (!n) {
+    printQuota({ round: 'now', rows: Object.entries(snap.judges).flatMap(([judge, q]) => q.buckets.map((b) => ({ judge, ...b, perRound: null, roundsLeft: null }))), errors: snap.errors });
+    return;
+  }
+  if (!existsSync(roundDir(n))) die(`round ${n} does not exist yet.`);
+  writeJson(quotaPath(n), snap);
+  printQuota(quotaReport(n, cfg));
+  if (cfg.judges.includes('claude') && !snap.judges.claude) {
+    console.log('  claude   not recorded. Add --claude "5-hour:<used>,weekly:<used>" from the usage panel.');
+  }
+}
+
+// Serves council/ on this machine only, so the gallery opens in any browser.
+async function cmdServe(portArg) {
+  const { createServer } = await import('node:http');
+  const types = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.json': 'application/json', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.md': 'text/plain; charset=utf-8', '.txt': 'text/plain; charset=utf-8' };
+  if (!existsSync(DIR)) die('no council/ here. Run `init` from the project root first.');
+  const server = createServer((req, res) => {
+    let path;
+    try {
+      path = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+    } catch {
+      return res.writeHead(400).end();
+    }
+    if (path === '/') path = '/gallery/index.html';
+    if (path.endsWith('/')) path += 'index.html';
+    const file = resolve(DIR, `.${path}`);
+    // Never serve the login cookies.
+    if (!file.startsWith(DIR + '/') || basename(file) === 'auth.json' || !existsSync(file) || !statSync(file).isFile()) {
+      return res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
+    }
+    res.writeHead(200, { 'content-type': types[extname(file).toLowerCase()] ?? 'application/octet-stream', 'cache-control': 'no-store' });
+    createReadStream(file).pipe(res);
+  });
+  let port = Number(portArg) || 8766;
+  const max = port + 10;
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE' && port < max) server.listen(++port, '127.0.0.1');
+    else die(e.message);
+  });
+  server.on('listening', () => console.log(`serving council/ at http://127.0.0.1:${port}/gallery/index.html  (Ctrl-C stops it)`));
+  server.listen(port, '127.0.0.1');
+}
+
 // ---------- commands ----------
 
 function cmdInit() {
@@ -1324,6 +1708,10 @@ async function cmdJudge(n, names) {
   await runJobs(cfg, jobs);
 }
 
+// Printed on stderr, so it never ends up in a prompt saved with `>`.
+const claudeHint = (cfg) =>
+  `ui-council: give this prompt to a new subagent with model ${cfg.models?.claude ?? '(the most capable the Agent tool offers)'} and effort ${cfg.efforts?.claude ?? 'max'}.`;
+
 function cmdPrompt(n, kind = 'claude') {
   const cfg = loadConfig();
   const compare = kind.endsWith('-compare');
@@ -1332,6 +1720,7 @@ function cmdPrompt(n, kind = 'claude') {
   if (!task) die(`round ${n} has no earlier accepted round with matching screens to compare with.`);
   // A new prompt means a new judgment: clear the old result so tally never reads a stale one.
   for (const f of [task.outFile, task.rawFile]) rmSync(join(roundDir(n), f), { force: true });
+  if (judge === 'claude') console.error(claudeHint(cfg));
   console.log(task.prompt);
 }
 
@@ -1469,6 +1858,10 @@ function cmdTally(n) {
     console.log('  Small fixes are not moving these. Make one structural change for each in the next round.');
   }
 
+  const quota = quotaReport(n, cfg);
+  if (quota) printQuota(quota);
+  else console.log(`\nquota: not recorded for round ${n}. Run \`quota ${n}\` after judging.`);
+
   const invalid = [...counted, ...compares].filter((r) => r.status === 'invalid').map((r) => r.judge);
   const missingCompare = compares.filter((c) => c.status === 'not run').map((c) => c.judge);
   const allPass = ran.length > 0 && ran.every((r) => r.status === 'pass');
@@ -1489,6 +1882,10 @@ function cmdTally(n) {
   else {
     next = `run \`fixes ${n}\`, make or decline every request, then capture round ${round + 1}`;
     if (stuck.length) next += `. Stuck: ${stuck.map((s) => s.category).join(', ')}: make one structural change for each`;
+  }
+  if (quota?.low.length && !next.startsWith('PASS')) {
+    const low = quota.low.map((r) => `${r.judge} ${r.name} ${pct(r.left)} left${r.roundsLeft != null ? ` (~${r.roundsLeft} rounds)` : ''}, resets ${when(r.resetsAt)}`);
+    next += `. QUOTA LOW: ${low.join('; ')}. Ask the user before round ${round + 1}`;
   }
   console.log(`\nNEXT: ${next}`);
 
@@ -1951,6 +2348,7 @@ function cmdExamPrompt(judge = 'claude', pass) {
   const cfg = loadConfig();
   const task = examTask(judge, pass, cfg);
   for (const f of [task.outFile, task.rawFile]) rmSync(examPath(f), { force: true });
+  if (judge === 'claude') console.error(claudeHint(cfg));
   console.log(task.prompt);
 }
 
@@ -2126,8 +2524,37 @@ ${data.map((r) => {
   return `<tr><th><a href="#r${r.n}">Round ${r.n}</a></th>${cells}<td class="${r.checks?.pass ? 'ok' : 'low'}">${r.checks ? (r.checks.pass ? 'pass' : 'fail') : '-'}</td><td>${ch}</td><td><span class="chip ${cls}">${text}</span></td></tr>`;
 }).join('\n')}</tbody></table>`;
 
+  // What each round cost, from council/usage.jsonl, and the quota left after the latest recorded round.
+  const usage = readUsage();
+  const kTok = (x) => (x >= 1e6 ? `${(x / 1e6).toFixed(1)}M` : `${Math.round(x / 1000)}k`);
+  const costOf = (n) => {
+    const by = {};
+    for (const u of usage.filter((x) => x.where === `rounds/${n}`)) {
+      const b = (by[u.judge] ??= { total: 0, seconds: 0, calls: 0 });
+      b.total += u.total ?? 0;
+      b.seconds += u.seconds ?? 0;
+      b.calls++;
+    }
+    return by;
+  };
+  const withQuota = data.filter((r) => existsSync(quotaPath(r.n))).at(-1);
+  const quota = withQuota ? quotaReport(withQuota.n, cfg) : null;
+  const perRound = {};
+  for (const r of data) for (const [j, c] of Object.entries(costOf(r.n))) (perRound[j] ??= []).push(c.total);
+  const avgTok = Object.entries(perRound).map(([j, xs]) => `${esc(j)} about ${kTok(xs.reduce((a, x) => a + x, 0) / xs.length)} tokens a round`).join(', ');
+  const quotaPanel = quota
+    ? `<section class="quota"><h2>Quota left after round ${quota.round}</h2>
+<table class="grid"><thead><tr><th>Judge</th><th>Limit</th><th>Left</th><th>Resets</th><th>More rounds<span>at the recent rate</span></th></tr></thead><tbody>
+${quota.rows.map((q) => `<tr><th>${esc(q.judge)}</th><td>${esc(q.name)}</td><td class="${q.left < 10 || (q.roundsLeft != null && q.roundsLeft < 2) ? 'low' : 'ok'}">${pct(q.left)}</td><td>${esc(when(q.resetsAt))}</td><td>${q.roundsLeft != null ? `about ${q.roundsLeft}` : '<span class="muted">not known yet</span>'}</td></tr>`).join('\n')}
+</tbody></table>${avgTok ? `<p class="src">${avgTok}. Claude judges run as subagents of the session, so their tokens are not counted here.</p>` : ''}</section>`
+    : '';
+
   const sections = data.map((r) => {
     const [cls, text] = verdict(r);
+    const cost = Object.entries(costOf(r.n));
+    const costLine = cost.length
+      ? `<p class="src">Cost: ${cost.map(([j, c]) => `${esc(j)} ${kTok(c.total)} tokens in ${Math.round(c.seconds / 60)} min`).join(', ')}.</p>`
+      : '';
     const ran = cfg.judges.filter((j) => r.scores[j]);
     const table = ran.length
       ? `<table class="grid scores"><thead><tr><th>Category</th>${ran.map((j) => `<th>${esc(j)}</th>`).join('')}</tr></thead><tbody>${CAT_KEYS.map((k) => `<tr><th>${catName(k)}</th>${ran.map((j) => { const v = r.scores[j].scores[k]; return `<td class="${v >= t ? 'ok' : 'low'}">${one(v)}</td>`; }).join('')}</tr>`).join('')}</tbody></table>`
@@ -2169,7 +2596,7 @@ ${data.map((r) => {
   ${changes}
   <div class="facts">
     <div>${table}</div>
-    <div><h3>Objective checks</h3><ul class="gates">${gates}${tells}</ul>${votes}</div>
+    <div><h3>Objective checks</h3><ul class="gates">${gates}${tells}</ul>${votes}${costLine}</div>
   </div>
   ${requests}
 </section>`;
@@ -2197,6 +2624,7 @@ td.ok { color: var(--ok); } td.low { color: var(--low); } td.none { color: var(-
 .chip { display: inline-block; font-size: 13px; font-weight: 600; padding: 2px 10px; border-radius: 999px; background: var(--line); }
 .chip.pass, .chip.kept { background: var(--ok-bg); color: var(--ok); }
 .chip.rejected { background: var(--low-bg); color: var(--low); }
+.quota { margin: 0 0 32px; } .quota h2 { margin-bottom: 12px; } .quota p { margin: 8px 0 0; }
 .round { margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--line); }
 .round header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
@@ -2218,7 +2646,8 @@ pre { white-space: pre-wrap; font: 13px/1.5 ui-monospace, Menlo, monospace; marg
 </style></head>
 <body><main>
 <h1>${esc(name)}: every round</h1>
-<p class="lede">${data.length} rounds. The goal: every judge at ${t} or higher in every category, and every objective check passing. ${passed ? `Reached in round ${passed.n}.` : 'Not reached yet.'} Blue numbered boxes on a round's screenshots mark each change made for that round, and the list under them says which judge asked for it. Judges always score clean screenshots. Green means ${t} or higher. Click a screenshot to open it full size.</p>
+<p class="lede">${data.length} rounds. The goal: every judge at ${t} or higher in every category, and every objective check passing. ${passed ? `Reached in round ${passed.n}.` : 'Not reached yet.'} Blue numbered boxes on a round's screenshots mark each change made for that round, and the list under them says which judge asked for it. Judges always score clean screenshots. Green means ${t} or higher. Click a screenshot to open it full size. <a href="#r${data.at(-1).n}">Jump to the latest round</a>.</p>
+${quotaPanel}
 ${progress}
 ${sections}
 </main></body></html>
@@ -2244,6 +2673,13 @@ const USAGE = `usage: node council.mjs <command>   (run from the project root)
                             to mark "done" (what changed, where) or "declined" (why)
   history                   scores, checks, and votes across rounds
   gallery                   write council/gallery/index.html: every round, changes marked
+  serve [port]              serve council/ on 127.0.0.1 (default 8766) to view the gallery
+  models [--apply] [--claude <model>]
+                            list each judge's models; --apply saves the most capable model
+                            and deepest effort available now
+  quota [round] [--claude "5-hour:<used>[@reset],weekly:<used>[@reset]"]
+                            quota left for each judge; with a round, save it and estimate
+                            how many more rounds each limit allows
 
 taste exam (checks each judge's taste against yours):
   exam build [--trusted]    make pairs: uglified copies of your screens, plus past rounds.
@@ -2281,6 +2717,15 @@ switch (cmd) {
     break;
   case 'gallery':
     cmdGallery();
+    break;
+  case 'serve':
+    await cmdServe(rest[0]);
+    break;
+  case 'models':
+    await cmdModels(rest);
+    break;
+  case 'quota':
+    await cmdQuota(rest);
     break;
   case 'exam': {
     const [sub, ...args] = rest;

@@ -1,6 +1,6 @@
 ---
 name: ui-council
-description: Improve a web app's UI with a hill-climb loop. Each round screenshots the app, runs objective design checks and AI-slop checks, and has a council of three AI judges (Codex CLI, fresh Claude subagents, Gemini through the Antigravity CLI) score it blind against reference apps and compare it with the last accepted round. A taste exam checks each judge against the user's own picks first, and judges with poor taste stop counting. The builder makes or declines every change the judges ask for, marks each change on the next screenshots, reverts changes the judges call worse, and repeats until every judge and check passes. Use for /ui-council, "run the UI council", "hill climb the design", or making an app's UI look better with multi-model design review.
+description: Improve a web app's UI with a hill-climb loop. Each round screenshots the app, runs objective design checks and AI-slop checks, and has a council of three AI judges (Codex CLI, fresh Claude subagents, Gemini through the Antigravity CLI) score it blind against reference apps and compare it with the last accepted round. A taste exam checks each judge against the user's own picks first, and judges with poor taste stop counting. The builder makes or declines every change the judges ask for, marks each change on the next screenshots, reverts changes the judges call worse, and repeats until every judge and check passes. Every judge runs the most capable model and deepest reasoning effort available. After each round the user sees a gallery of marked screenshots and how much Codex, Gemini and Claude quota is left. Use for /ui-council, "run the UI council", "hill climb the design", or making an app's UI look better with multi-model design review.
 argument-hint: "[goal, e.g. threshold 9.5 or focus on the settings page]"
 ---
 
@@ -14,7 +14,7 @@ Hill-climb a web app's UI. Each round has five steps:
 4. You keep or revert the round. Then you make or decline every change the judges asked for, and record each one.
 5. Repeat until every judge and every check passes.
 
-The judges are the Codex CLI, fresh Claude subagents, and the Antigravity CLI (`agy`) running a Gemini model. Every judge judges every round. You are the builder: you make the changes. The Claude judges are separate subagents with a fresh context. They never see your work in progress, and you never judge your own work.
+The judges are the Codex CLI, fresh Claude subagents, and the Antigravity CLI (`agy`) running a Gemini model. Every judge judges every round, with the most capable model and the deepest reasoning effort its provider offers at the time. You are the builder: you make the changes. The Claude judges are separate subagents with a fresh context. They never see your work in progress, and you never judge your own work.
 
 The helper script does the mechanical parts. Run it from the project root:
 
@@ -37,7 +37,7 @@ Below, `council <command>` is short for that line. Run it with no command to see
    - `checks`: the objective checks. `contrast` and `overflow` require zero failures. `maxFontSizes`, `maxFontFamilies`, `maxFontWeights` and `maxRadii` cap how many distinct values the pages use. Set a limit to `null` to turn it off. Set limits that fit the design language: for example, a pixel-art site may need a pixel display font and a separate body font. If round 1 is far over a limit, ask the user whether the limit fits the app before you start.
    - `checks.tells`: AI-slop tells found in the page itself, such as headings that end with a period, eyebrow labels above headings, long ALL CAPS lines, negative letter-spacing, Instrument Serif, monospace outside code, many italics, large gradient backgrounds, many pills, and section numbers like "01 ·". They are warnings, never gates. If the design language uses one on purpose, the user can list its name in `checks.allowTells`, for example `["mono-overuse"]` for a terminal-style site.
    - `judges`: every judge listed here judges every round.
-   - `models`: optional model overrides. `agy` defaults to `gemini-4-argon-high`. `agy models` lists the choices. Keep a Gemini model for `agy`, so the council has three different providers.
+   - `models` and `efforts`: the model and reasoning effort of each judge. Step 11 fills them in. Keep a Gemini model for `agy`, so the council has three different providers.
 5. Make sure the dev server is running and every URL loads.
 6. If screens need a login, ask the user to run this, log in, and close the window:
    ```bash
@@ -48,6 +48,9 @@ Below, `council <command>` is short for that line. Run it with no command to see
 8. Write any notes about this product from the user into `council/notes.md`, for example "Too grayscale: keep the brand color on primary actions." Judges and you both follow these notes.
 9. Show the user `council/taste.md`. It holds the taste rules every judge applies in any style: the UX and UI basics, fidelity to the design language, and the generic AI-template tells that cost points. Edit it only as the user asks. `init` copies the skill's current rules into the project, and the project keeps its own copy after that. Later changes to the skill's `taste.md` do not reach it. Ask the user before you copy a newer version over it.
 10. Check the CLIs with `codex --version` and `agy --version`. Remove any missing judge from `judges`. If `agy` is not signed in, ask the user to run `agy` once in a terminal and sign in with their Google account. The old Gemini CLI (`gemini`) no longer accepts Google AI Pro or free accounts. It works only with a paid `GEMINI_API_KEY`. Add `gemini` to `judges` only if the user has one. Never ask the user to paste a key into the chat.
+
+11. **Models.** Run `council models`. It lists the models each CLI offers right now and the best pick for each judge: the most capable model at its deepest reasoning effort. For Codex it skips the `ultra` effort, because that adds automatic delegation to other agents, which a read-only judge does not need and which costs more. For Claude judges, choose the most capable model the Agent tool offers in this session, for example `opus`. Then run `council models --apply --claude <model>`. It saves the picks in `models` and `efforts` in the config. Tell the user which model each judge uses. Never pick a cheaper model or a lower effort to save quota unless the user asks.
+12. **Progress view.** Start `council serve` with Bash `run_in_background: true` and keep it running. It serves `council/` on 127.0.0.1 and prints the gallery URL. If the port is taken, it tries the next one.
 
 If the user gave a goal in the arguments, apply it to the config (for example a higher threshold) or to the screen list.
 
@@ -63,7 +66,7 @@ The built-in answers assume the original screens are decent, since an uglified c
 2. **The user's picks.** Ask the user to open `council/exam/index.html` in a browser (on macOS: `open council/exam/index.html`) and pick the better screen in each pair. It takes about two minutes. At the end the page shows a code. When they paste it, run `council exam answer <code>`. Never take the exam for the user. If they skip it, the judges are checked against the built-in answers only. Tell them so.
 3. **The judges take it.** In parallel:
    - Codex and agy: `council exam run codex agy`, with Bash `run_in_background: true`.
-   - Claude: run `council exam prompt claude 1` and `council exam prompt claude 2`. Pass each output word for word to its own new `general-purpose` subagent.
+   - Claude: run `council exam prompt claude 1` and `council exam prompt claude 2`. Pass each output word for word to its own new `general-purpose` subagent, with `model` set to `models.claude` and `effort` set to `efforts.claude` from the config.
 
    Each judge takes the exam twice, with every pair swapped and in a new order. That measures consistency as well as agreement.
 4. **Score.** Run `council exam score`. A judge is fit when it agrees with the right answers at least 75% of the time and gives the same answer on both passes at least 75% of the time. The right answer is the user's pick when there is one, otherwise the built-in answer. Show the user the table.
@@ -72,7 +75,7 @@ The built-in answers assume the original screens are decent, since an uglified c
    - If a judge is unfit, suggest another model for it in `models` (for `agy`, `agy models` lists the choices), then retake the judge part for that judge.
    - If no judge is fit, stop and ask the user.
 
-Retake the judge part whenever `taste.md`, `notes.md`, the prompts or the models change. `tally` says when the exam is out of date.
+Retake the judge part whenever `taste.md`, `notes.md`, the prompts, the models or the efforts change. `tally` says when the exam is out of date.
 
 ## Loop
 
@@ -83,8 +86,10 @@ Round 1 is the baseline, before any change. For round N:
    Before you judge, look at the full and marked screenshots yourself. If a change broke something, such as text that now wraps, an overflow, or a size under the check limits, fix it now. Fold the fix into the round's commit with `git commit --amend --no-edit`, update the `commit` field, and capture again. One commit per round keeps a revert clean. Never amend a commit from an earlier round.
 2. **Judge.** Run every judge in every round. Start them all in parallel:
    - Codex and agy: run `council judge N`. Use Bash with `run_in_background: true`, because it can take several minutes. From round 2 on, each judge also compares this round with the last accepted round.
-   - Claude scoring: run `council prompt N claude`. Pass its output word for word as the prompt of a new `general-purpose` subagent.
+   - Claude scoring: run `council prompt N claude`. Pass its output word for word as the prompt of a new `general-purpose` subagent, with `model` set to `models.claude` and `effort` set to `efforts.claude` from the config. The command prints both on stderr as a reminder.
    - Claude comparison, from round 2 on: run `council prompt N claude-compare`. Pass its output word for word to a second new `general-purpose` subagent.
+
+   When every judge has finished, record the quota: `council quota N`. It reads what is left of the Codex and Gemini limits, which costs no tokens. If this session has a usage tool that shows the Claude plan limits (in the Claude desktop app, `get_usage`), add them as percent used, with the reset time when known: `council quota N --claude "5-hour:14@2026-11-05T20:50Z,weekly:17@2026-11-11T10:00Z"`. Without such a tool, leave `--claude` out.
 
    Each Claude prompt must go to its own fresh subagent, so one never sees the other's images. Never judge in this session. Long prompts can instead be saved to a file (for example `council/rounds/N/claude.prompt.md`) and given to the subagent as "Read this file and follow it exactly. Apart from that file, read only the screenshots it lists." That keeps your own context small.
 3. **Tally.** Run `council tally N`. It prints our scores, the checks, the comparison votes, and a `NEXT:` line. Do exactly what `NEXT:` says:
@@ -95,8 +100,12 @@ Round 1 is the baseline, before any change. For round N:
    - `run fixes N`: go to step 4.
    - `Stuck: <category>` at the end of `NEXT`: that category stayed under the threshold, with almost no gain, over the last three accepted rounds. Small fixes have stopped moving it. In the next round, make one structural change for each stuck category instead of more nudges. For example: one shared column grid for every section, one spacing scale with gaps between sections clearly larger than gaps inside them, or a redrawn icon set in one style. Record it in `extra` unless a request already covers it, and tell the user about it in your round summary.
    - `STOP: max rounds`: if it says to revert, revert first. Then go to Finish and report that the council did not pass.
+   - `QUOTA LOW` at the end of `NEXT`: a judge's limit is under 10%, or will run out within about 2 rounds at the recent rate. Do any revert `NEXT` asks for, then stop and ask the user whether to continue now, wait for the reset, or stop. Never drop a judge or lower a model to get around it.
 
-   Then run `council gallery` to refresh `council/gallery/index.html`.
+   Then show the user the round:
+   - Run `council gallery` to refresh `council/gallery/index.html`.
+   - Open `<serve URL>#r<N>` for the user. In the Claude desktop app, open it in the built-in browser. In a terminal, run `open <URL>` on macOS. If the server is not running, start `council serve` again.
+   - In chat, report in a few lines: each judge's average and lowest score, the vote, how many changes were made and declined with two or three examples, and the quota left with the rough number of rounds it allows.
 4. **The change list.** Run `council fixes N`. It writes `council/rounds/<N+1>/changes.json` with every request from round N, each with an id: objective check failures, screens that got worse, every issue from every judge (with the screen, where on it, the problem and the fix), and the AI-slop tells. Answer every request:
    - **done**: set `"status": "done"`, write in `did` exactly what you changed, with values (for example "Basket line text 16px to 18px, color #6b5a48 to #4a3a2a"), and add `marks`: one or more `{ "screen": "<screen name>", "selector": "<CSS selector of the changed element>" }`, so capture can box it.
    - **declined**: set `"status": "declined"` and write the reason in `did`. Decline only when the request conflicts with `council/style.md` or `council/notes.md`, reverses a change the blind vote kept, asks for the opposite of another judge's request (do one, decline the other, and say which), or is a tell the design language calls for. Never decline a request because it is hard. When judges ask for the same change, mark each one done, write "Same change as <id>" in the later ones, and give them the same marks.
@@ -139,13 +148,20 @@ The three judges see different things, so each round needs all of them. A pass n
 - Claude judges must not run commands. If this environment has an agent type limited to the Read and Write tools, use it for judge subagents.
 - When `notes.md` and a judge disagree, follow `notes.md`.
 - Git: work only on the `ui-council/...` branch. Undo with `git revert`, never with `git reset --hard` or a force push. Never push or merge.
-- Each round uses the user's Codex, Claude and Antigravity (Google AI) quota. Do not raise `maxRounds` without asking.
+- Each round uses the user's Codex, Claude and Antigravity (Google AI) quota. Do not raise `maxRounds` without asking. Record the quota after every round, and ask the user when `NEXT` says the quota is low.
+- Every judge uses the most capable model and the deepest effort its provider offers. Do not lower them to save quota unless the user asks. When a session continues an earlier run, run `council models` first. If a better model is now available, apply it, tell the user, and retake the judge part of the taste exam.
 
 ## Finish
 
-1. Run `council history` to show scores, checks and votes per round, and `council gallery` for the page with every round. Give the user its path: `council/gallery/index.html`.
+1. Run `council history` to show scores, checks and votes per round, and `council gallery` for the page with every round. Open it for the user as in each round, and report the quota left. Give the user its path: `council/gallery/index.html`.
 2. Show the user round 1 and the final round screenshots for the same screens, and the marked screenshots of the last round. Give the file paths.
 3. Summarize: the number of rounds, how the scores changed, the main changes, any reverted rounds, and where judges still disagree.
 4. Tell the user the branch name. They decide whether to merge it.
 5. Ask the user for a taste check. Write their notes into `council/notes.md`. If they want to go further, raise `threshold` (for example to 9.5) and continue from the next round number.
 6. Offer a fresh taste exam (`council exam build`). It now includes this run's real before/after pairs, so the user's picks keep teaching the council their taste.
+
+## Cost
+
+Each round makes two calls per judge: one to score and one to compare. The taste exam adds two passes per judge each time it is taken. `council/usage.jsonl` logs the tokens and time of every Codex and agy call. The gallery shows each round's cost and the quota left, and `tally` estimates how many more rounds each limit allows from the drop between recorded rounds.
+
+As a rough guide, on a Google AI Pro plan one round used about 50k agy tokens and about 2% of the weekly Gemini 4 Argon limit, so about 40 rounds a week. Larger pages, more screens and deeper reasoning cost more.
