@@ -1299,10 +1299,22 @@ function codexAppServer(calls, timeoutMs = 30000) {
   });
 }
 
-// The deepest reasoning effort a model offers. "ultra" is skipped: it adds automatic
-// delegation to other agents, which a read-only judge gains nothing from and which costs more.
-const EFFORT_ORDER = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal'];
-const bestEffort = (list) => EFFORT_ORDER.find((e) => list.includes(e)) ?? null;
+// Judging screenshots takes perception and taste more than long chains of reasoning, so
+// judges start at "high". The deeper efforts cost far more for little gain on this task.
+// A judge that fails the taste exam moves up one step (`exam score` says so).
+// "ultra" is never used: it adds automatic delegation to other agents, which a judge does not need.
+const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const JUDGE_EFFORT = 'high';
+// The target effort if the model offers it, else the nearest one below, else the nearest above.
+function pickEffort(list, target = JUDGE_EFFORT) {
+  const t = EFFORTS.indexOf(target);
+  const ok = list.filter((e) => EFFORTS.includes(e));
+  if (ok.includes(target)) return target;
+  const below = ok.filter((e) => EFFORTS.indexOf(e) < t).sort((a, b) => EFFORTS.indexOf(b) - EFFORTS.indexOf(a));
+  const above = ok.filter((e) => EFFORTS.indexOf(e) > t).sort((a, b) => EFFORTS.indexOf(a) - EFFORTS.indexOf(b));
+  return below[0] ?? above[0] ?? null;
+}
+const nextEffort = (e) => (EFFORTS.includes(e) ? EFFORTS[Math.min(EFFORTS.indexOf(e) + 1, EFFORTS.length - 1)] : 'xhigh');
 const LIGHT = /(^|[-_ ])(flash|lite|mini|nano|spark|small|fast)([-_ ]|$)/i;
 
 function bestCodexModel(models) {
@@ -1314,19 +1326,23 @@ function bestCodexModel(models) {
 }
 
 // agy model ids look like gemini-4-argon-high: provider, version, family, effort.
-function bestAgyModel(ids) {
+// Picks the newest full-size Gemini family, then the variant closest to the target effort.
+function bestAgyModel(ids, target = JUDGE_EFFORT) {
   const parse = (id) => {
     const parts = id.split('-');
-    const effort = EFFORT_ORDER.includes(parts.at(-1)) ? parts.at(-1) : null;
+    const effort = EFFORTS.includes(parts.at(-1)) ? parts.at(-1) : null;
     const version = parseFloat(parts.find((p) => /^\d+(\.\d+)?$/.test(p)) ?? '0');
-    return { id, effort, version, light: LIGHT.test(id) };
+    return { id, effort, base: effort ? parts.slice(0, -1).join('-') : id, version, light: LIGHT.test(id) };
   };
-  const gemini = ids.filter((id) => /^gemini-/.test(id)).map(parse);
-  gemini.sort((a, b) =>
-    (a.light - b.light) ||
-    (b.version - a.version) ||
-    (EFFORT_ORDER.indexOf(a.effort ?? 'minimal') - EFFORT_ORDER.indexOf(b.effort ?? 'minimal')));
-  return gemini[0]?.id ?? null;
+  const rank = (a, b) => (a.light - b.light) || (b.version - a.version);
+  const gemini = ids.filter((id) => /^gemini-/.test(id)).map(parse).sort(rank);
+  if (!gemini.length) return { id: null, ties: [] };
+  const top = gemini[0];
+  // Families of the same version, for example Argon and Carbon: the names alone cannot rank them.
+  const ties = [...new Set(gemini.filter((g) => rank(g, top) === 0).map((g) => g.base))];
+  const variants = gemini.filter((g) => g.base === top.base);
+  const effort = pickEffort(variants.map((v) => v.effort).filter(Boolean), target);
+  return { id: variants.find((v) => v.effort === effort)?.id ?? top.id, ties };
 }
 
 async function agyModelIds() {
@@ -1340,6 +1356,9 @@ async function cmdModels(args) {
   const ci = args.indexOf('--claude');
   const claudeModel = ci >= 0 ? args[ci + 1] : null;
   if (ci >= 0 && !claudeModel) die('--claude needs the model name the Agent tool takes, for example opus.');
+  const ei = args.indexOf('--effort');
+  const target = ei >= 0 ? args[ei + 1] : JUDGE_EFFORT;
+  if (!EFFORTS.includes(target)) die(`--effort must be one of ${EFFORTS.join(', ')}.`);
   const best = { models: {}, efforts: {} };
 
   if (cfg.judges.includes('codex')) {
@@ -1354,7 +1373,7 @@ async function cmdModels(args) {
       const m = bestCodexModel(models);
       if (m) {
         best.models.codex = m.id;
-        best.efforts.codex = bestEffort((m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort));
+        best.efforts.codex = pickEffort((m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort), target);
       }
     } catch (e) {
       console.log(`codex: could not list models (${e.message})`);
@@ -1363,13 +1382,16 @@ async function cmdModels(args) {
   if (cfg.judges.includes('agy')) {
     const ids = await agyModelIds();
     console.log(`\nagy models:\n${ids.map((m) => `  ${m.id.padEnd(28)} ${m.name}`).join('\n') || '  none listed. Is agy signed in?'}`);
-    const id = bestAgyModel(ids.map((m) => m.id));
+    const { id, ties } = bestAgyModel(ids.map((m) => m.id), target);
     // The effort is part of an agy model id, for example gemini-4-argon-high.
     if (id) best.models.agy = id;
+    if (ties.length > 1) {
+      console.log(`  Several Gemini families share the newest version: ${ties.join(', ')}. Picked ${id}. If another one is better at judging design, set models.agy to it and retake the exam.`);
+    }
   }
   if (claudeModel) {
     best.models.claude = claudeModel;
-    best.efforts.claude = 'max';
+    best.efforts.claude = target;
   }
 
   const row = (j) => {
@@ -1710,7 +1732,7 @@ async function cmdJudge(n, names) {
 
 // Printed on stderr, so it never ends up in a prompt saved with `>`.
 const claudeHint = (cfg) =>
-  `ui-council: give this prompt to a new subagent with model ${cfg.models?.claude ?? '(the most capable the Agent tool offers)'} and effort ${cfg.efforts?.claude ?? 'max'}.`;
+  `ui-council: give this prompt to a new subagent with model ${cfg.models?.claude ?? '(the most capable the Agent tool offers)'} and effort ${cfg.efforts?.claude ?? JUDGE_EFFORT}.`;
 
 function cmdPrompt(n, kind = 'claude') {
   const cfg = loadConfig();
@@ -2446,6 +2468,16 @@ function cmdExamScore() {
     const verdict = r.fit == null ? (r.note || 'unknown') : r.fit ? 'fit' : 'UNFIT: ignored by tally';
     console.log(`${j.padEnd(8)} ${pct(r.agreement)}   ${pct(r.consistency)}        ${frac(r.byKind?.flaw).padEnd(7)} ${frac(r.byKind?.tell).padEnd(7)} ${frac(r.byKind?.style).padEnd(7)} ${frac(r.byKind?.history).padEnd(7)} ${verdict}`);
   }
+  // Judges start at a moderate effort. One that fails moves up a step before anything else changes.
+  for (const j of cfg.judges.filter((x) => judges[x].fit === false)) {
+    const now = j === 'agy' ? (cfg.models?.agy ?? AGY_MODEL).split('-').at(-1) : (cfg.efforts?.[j] ?? 'default');
+    const up = nextEffort(now);
+    console.log(
+      up === now
+        ? `\n${j} is unfit at its deepest effort. Try another model for it in models.${j}, then retake its part.`
+        : `\n${j} is unfit at effort ${now}. Raise it one step to ${up} (${j === 'agy' ? `the models.agy variant ending in -${up}, if agy lists one` : `efforts.${j}`}), then retake its part.`,
+    );
+  }
   if (!answered) {
     console.log(`\nJudges were checked against the built-in answers only. Take the exam yourself: open ${rel(examPath('index.html'))}.`);
   } else if (ruleItems.length) {
@@ -2674,9 +2706,9 @@ const USAGE = `usage: node council.mjs <command>   (run from the project root)
   history                   scores, checks, and votes across rounds
   gallery                   write council/gallery/index.html: every round, changes marked
   serve [port]              serve council/ on 127.0.0.1 (default 8766) to view the gallery
-  models [--apply] [--claude <model>]
+  models [--apply] [--claude <model>] [--effort <level>]
                             list each judge's models; --apply saves the most capable model
-                            and deepest effort available now
+                            at the judging effort (default high)
   quota [round] [--claude "5-hour:<used>[@reset],weekly:<used>[@reset]"]
                             quota left for each judge; with a round, save it and estimate
                             how many more rounds each limit allows

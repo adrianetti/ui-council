@@ -1,6 +1,6 @@
 ---
 name: ui-council
-description: Improve a web app's UI with a hill-climb loop. Each round screenshots the app, runs objective design checks and AI-slop checks, and has a council of three AI judges (Codex CLI, fresh Claude subagents, Gemini through the Antigravity CLI) score it blind against reference apps and compare it with the last accepted round. A taste exam checks each judge against the user's own picks first, and judges with poor taste stop counting. The builder makes or declines every change the judges ask for, marks each change on the next screenshots, reverts changes the judges call worse, and repeats until every judge and check passes. Every judge runs the most capable model and deepest reasoning effort available. After each round the user sees a gallery of marked screenshots and how much Codex, Gemini and Claude quota is left. Use for /ui-council, "run the UI council", "hill climb the design", or making an app's UI look better with multi-model design review.
+description: Improve a web app's UI with a hill-climb loop. Each round screenshots the app, runs objective design checks and AI-slop checks, and has a council of three AI judges (Codex CLI, fresh Claude subagents, Gemini through the Antigravity CLI) score it blind against reference apps and compare it with the last accepted round. A taste exam checks each judge against the user's own picks first, and judges with poor taste stop counting. The builder makes or declines every change the judges ask for, marks each change on the next screenshots, reverts changes the judges call worse, and repeats until every judge and check passes. Every judge runs the most capable model available, at a reasoning effort suited to judging. After each round the user sees a gallery of marked screenshots and how much Codex, Gemini and Claude quota is left. Use for /ui-council, "run the UI council", "hill climb the design", or making an app's UI look better with multi-model design review.
 argument-hint: "[goal, e.g. threshold 9.5 or focus on the settings page]"
 ---
 
@@ -14,7 +14,7 @@ Hill-climb a web app's UI. Each round has five steps:
 4. You keep or revert the round. Then you make or decline every change the judges asked for, and record each one.
 5. Repeat until every judge and every check passes.
 
-The judges are the Codex CLI, fresh Claude subagents, and the Antigravity CLI (`agy`) running a Gemini model. Every judge judges every round, with the most capable model and the deepest reasoning effort its provider offers at the time. You are the builder: you make the changes. The Claude judges are separate subagents with a fresh context. They never see your work in progress, and you never judge your own work.
+The judges are the Codex CLI, fresh Claude subagents, and the Antigravity CLI (`agy`) running a Gemini model. Every judge judges every round, with the most capable model its provider offers at the time, at a reasoning effort suited to judging. You are the builder: you make the changes. The Claude judges are separate subagents with a fresh context. They never see your work in progress, and you never judge your own work.
 
 The helper script does the mechanical parts. Run it from the project root:
 
@@ -49,7 +49,7 @@ Below, `council <command>` is short for that line. Run it with no command to see
 9. Show the user `council/taste.md`. It holds the taste rules every judge applies in any style: the UX and UI basics, fidelity to the design language, and the generic AI-template tells that cost points. Edit it only as the user asks. `init` copies the skill's current rules into the project, and the project keeps its own copy after that. Later changes to the skill's `taste.md` do not reach it. Ask the user before you copy a newer version over it.
 10. Check the CLIs with `codex --version` and `agy --version`. Remove any missing judge from `judges`. If `agy` is not signed in, ask the user to run `agy` once in a terminal and sign in with their Google account. The old Gemini CLI (`gemini`) no longer accepts Google AI Pro or free accounts. It works only with a paid `GEMINI_API_KEY`. Add `gemini` to `judges` only if the user has one. Never ask the user to paste a key into the chat.
 
-11. **Models.** Run `council models`. It lists the models each CLI offers right now and the best pick for each judge: the most capable model at its deepest reasoning effort. For Codex it skips the `ultra` effort, because that adds automatic delegation to other agents, which a read-only judge does not need and which costs more. For Claude judges, choose the most capable model the Agent tool offers in this session, for example `opus`. Then run `council models --apply --claude <model>`. It saves the picks in `models` and `efforts` in the config. Tell the user which model each judge uses. Never pick a cheaper model or a lower effort to save quota unless the user asks.
+11. **Models.** Run `council models`. It lists the models each CLI offers right now and picks one per judge: the most capable model, at `high` reasoning effort. Judging screenshots takes perception and taste more than long chains of reasoning, and the most capable model matters more than the deepest effort. The `xhigh` and `max` efforts cost far more for little gain on this task. Codex's `ultra` is never used: it adds automatic delegation to other agents, which a judge does not need. For Claude judges, choose the most capable model the Agent tool offers in this session, for example `opus`. Then run `council models --apply --claude <model>`. It saves the picks in `models` and `efforts` in the config. Tell the user which model and effort each judge uses. If several model families share the newest version, `models` says so; pick the one known to be better at visual judgment, or ask the user. Never pick a cheaper model to save quota unless the user asks.
 12. **Progress view.** Start `council serve` with Bash `run_in_background: true` and keep it running. It serves `council/` on 127.0.0.1 and prints the gallery URL. If the port is taken, it tries the next one.
 
 If the user gave a goal in the arguments, apply it to the config (for example a higher threshold) or to the screen list.
@@ -72,7 +72,7 @@ The built-in answers assume the original screens are decent, since an uglified c
 4. **Score.** Run `council exam score`. A judge is fit when it agrees with the right answers at least 75% of the time and gives the same answer on both passes at least 75% of the time. The right answer is the user's pick when there is one, otherwise the built-in answer. Show the user the table.
 5. **Act on the result.**
    - If the user preferred an uglified "AI tell" version, the score lists it. Ask whether `council/taste.md` should change. If they say yes, edit it, then retake the judge part (step 3 and 4). Their picks are kept.
-   - If a judge is unfit, suggest another model for it in `models` (for `agy`, `agy models` lists the choices), then retake the judge part for that judge.
+   - If a judge is unfit, first raise its effort one step, as `exam score` suggests, and retake its part. If it is still unfit at its deepest effort, suggest another model for it in `models` (for `agy`, `agy models` lists the choices), then retake its part.
    - If no judge is fit, stop and ask the user.
 
 Retake the judge part whenever `taste.md`, `notes.md`, the prompts, the models or the efforts change. `tally` says when the exam is out of date.
@@ -149,7 +149,7 @@ The three judges see different things, so each round needs all of them. A pass n
 - When `notes.md` and a judge disagree, follow `notes.md`.
 - Git: work only on the `ui-council/...` branch. Undo with `git revert`, never with `git reset --hard` or a force push. Never push or merge.
 - Each round uses the user's Codex, Claude and Antigravity (Google AI) quota. Do not raise `maxRounds` without asking. Record the quota after every round, and ask the user when `NEXT` says the quota is low.
-- Every judge uses the most capable model and the deepest effort its provider offers. Do not lower them to save quota unless the user asks. When a session continues an earlier run, run `council models` first. If a better model is now available, apply it, tell the user, and retake the judge part of the taste exam.
+- Every judge uses the most capable model its provider offers, at `high` effort, or one step higher for a judge that failed the taste exam at `high`. Do not lower the model or effort to save quota unless the user asks. When a session continues an earlier run, run `council models` first. If a better model is now available, apply it, tell the user, and retake the judge part of the taste exam.
 
 ## Finish
 
