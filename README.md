@@ -1,6 +1,6 @@
 # ui-council
 
-A [Claude Code](https://claude.com/claude-code) skill that hill-climbs your web app's UI. Three AI judges (Codex, Claude and Gemini) score your screens blind, list exact fixes, and vote on whether each round is better than the last. Claude makes the changes. Rounds the judges call worse are reverted.
+A [Claude Code](https://claude.com/claude-code) skill that hill-climbs your web app's UI. A council of AI judges (Codex, Claude and Gemini by default) scores your screens blind, lists exact fixes, and votes on whether each round is better than the last. Claude makes the changes. Rounds the judges call worse are reverted.
 
 ![The council judging a farm site over 27 rounds](docs/council.gif)
 
@@ -59,6 +59,23 @@ Open Claude Code in your app's repository, start the dev server, and run:
 
 You can add a goal: `/ui-council threshold 9.5` or `/ui-council focus on the settings page`.
 
+### Pick your own council
+
+The default council is one Codex judge, one Claude judge and one Gemini judge. You can seat any other lineup:
+
+```
+/ui-council using 3 claudes and 1 gemini
+/ui-council using 2 chatgpt judges, claude opus and claude sonnet
+```
+
+Every judge scores and votes on its own, on its own shuffled copies of the screenshots. A few things to know when you choose:
+
+- Judges from one provider share blind spots and agree more often, so a mixed council gives a more independent vote.
+- Claude judges are the same family as the builder. A judge from another provider is the stronger check.
+- An even council can tie. A tie keeps the round.
+- A pass needs every judge at the threshold, so more judges make a pass harder and each round costs more quota.
+- Judges on the same model and effort share one taste exam.
+
 On the first run, Claude:
 
 - creates a `ui-council/<name>` branch. The loop commits there after each round. It never pushes or merges.
@@ -96,6 +113,7 @@ node ~/.claude/skills/ui-council/council.mjs <command>
 | --- | --- |
 | `history` | Scores, checks and votes across rounds |
 | `gallery`, `serve` | Build the progress gallery and serve it on 127.0.0.1:8766 |
+| `judges` | Show the council, or seat a new one: `judges claude=3 agy=1` |
 | `quota` | Quota left for each judge, and the rounds it allows |
 | `models` | Models each CLI offers now, and the pick for each judge |
 | `tally <round>` | One round's scores, vote and next step |

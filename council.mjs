@@ -20,6 +20,21 @@ const PLAYWRIGHT = 'playwright@1.61.1';
 const RUNTIME = join(SKILL_DIR, '.runtime');
 const JUDGE_TIMEOUT_MS = 15 * 60 * 1000;
 const EXTERNAL = ['codex', 'agy', 'gemini'];
+const KINDS = ['codex', 'claude', 'agy', 'gemini'];
+// A judge id is a kind, or a kind plus a suffix, so a council can seat several judges of one
+// kind: claude, claude-b, claude-sonnet. A model or effort is looked up by id, then by kind.
+const kindOf = (id) => KINDS.find((k) => id === k || String(id).startsWith(`${k}-`)) ?? null;
+const isExternal = (id) => EXTERNAL.includes(kindOf(id));
+const hasKind = (cfg, kind) => cfg.judges.some((j) => kindOf(j) === kind);
+const modelOf = (cfg, id) => cfg.models?.[id] ?? cfg.models?.[kindOf(id)] ?? null;
+const effortOf = (cfg, id) => cfg.efforts?.[id] ?? cfg.efforts?.[kindOf(id)] ?? null;
+const padJudge = (cfg, j) => String(j).padEnd(Math.max(8, ...cfg.judges.map((x) => x.length)));
+// An earlier judge with the same kind, model and effort. The two share one taste exam.
+function twinOf(cfg, j) {
+  const key = (x) => `${kindOf(x)}|${modelOf(cfg, x)}|${effortOf(cfg, x)}`;
+  const first = cfg.judges.find((x) => key(x) === key(j));
+  return first && first !== j ? first : null;
+}
 // agy can also run Claude and GPT models. Keep a Gemini model so the council has a third provider.
 const AGY_MODEL = 'gemini-4-argon-high';
 const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -187,7 +202,7 @@ function loadConfig() {
   const p = join(DIR, 'config.json');
   if (!existsSync(p)) die('no council/config.json here. Run `init` from the project root first.');
   const file = readJson(p);
-  return {
+  const cfg = {
     ...CONFIG_TEMPLATE,
     ...file,
     checks: { ...DEFAULT_CHECKS, ...file.checks },
@@ -195,6 +210,16 @@ function loadConfig() {
     models: { ...CONFIG_TEMPLATE.models, ...file.models },
     efforts: { ...CONFIG_TEMPLATE.efforts, ...file.efforts },
   };
+  if (!Array.isArray(cfg.judges) || !cfg.judges.length) die('council/config.json has no judges. Seat some with `judges`, for example `judges codex claude agy`.');
+  const seen = new Set();
+  for (const j of cfg.judges) {
+    if (typeof j !== 'string' || !kindOf(j) || !/^[a-z0-9][a-z0-9.-]*$/.test(j) || j.endsWith('-compare')) {
+      die(`unknown judge "${j}" in council/config.json. A judge is one of ${KINDS.join(', ')}, or one of them with a suffix, such as claude-b.`);
+    }
+    if (seen.has(j)) die(`judge "${j}" is listed twice in council/config.json. Give each judge its own id, such as ${j}-b.`);
+    seen.add(j);
+  }
+  return cfg;
 }
 
 const EXAM_DIR = join(DIR, 'exam');
@@ -239,6 +264,10 @@ function examStatus(cfg) {
   if (!existsSync(p)) return { state: 'none', unfit: new Set() };
   const r = readJson(p);
   if (r.hash !== tasteHash(cfg)) return { state: 'stale', unfit: new Set(), results: r };
+  for (const j of cfg.judges) {
+    const twin = twinOf(cfg, j);
+    if (!r.judges[j] && twin && r.judges[twin]) r.judges[j] = { ...r.judges[twin], sharedWith: twin };
+  }
   const unfit = new Set(Object.entries(r.judges).filter(([, j]) => j.fit === false).map(([k]) => k));
   return { state: 'ok', unfit, results: r };
 }
@@ -369,15 +398,15 @@ function blindCopies(dir, items) {
 }
 
 function manifest(judge, items) {
-  if (judge === 'codex') {
+  if (kindOf(judge) === 'codex') {
     return 'The images are attached in this order:\n' + items.map((it, k) => `- Image ${k + 1}: ${it.label}`).join('\n');
   }
-  if (judge === 'claude') return items.map((it) => `- ${it.path} : ${it.label}`).join('\n');
+  if (kindOf(judge) === 'claude') return items.map((it) => `- ${it.path} : ${it.label}`).join('\n');
   return items.map((it) => `- @${rel(it.path)} : ${it.label}`).join('\n');
 }
 
 function output(judge, shapeText, outPath) {
-  if (judge === 'claude') {
+  if (kindOf(judge) === 'claude') {
     return [
       'Use the Read tool to view every image listed above. Do not read any other file.',
       `Then use the Write tool to write only one JSON object, in exactly this shape, to ${outPath}:`,
@@ -387,7 +416,7 @@ function output(judge, shapeText, outPath) {
       'After writing the file, reply with the single word: done',
     ].join('\n');
   }
-  const lead = judge === 'codex'
+  const lead = kindOf(judge) === 'codex'
     ? 'Reply with only the JSON object. It must match the provided output schema:'
     : 'Reply with only one JSON object in exactly this shape. No prose, no code fences.';
   return `${lead}\n\n${shapeText}`;
@@ -665,8 +694,8 @@ function logUsage(judge, cfg, task, tokens, seconds) {
     where: relative(DIR, task.dir) || '.',
     judge,
     kind: task.tag,
-    model: cfg.models?.[judge] ?? null,
-    effort: cfg.efforts?.[judge] ?? null,
+    model: modelOf(cfg, judge),
+    effort: effortOf(cfg, judge),
     input: tokens?.input ?? null,
     cached: tokens?.cached ?? null,
     output: tokens?.output ?? null,
@@ -718,12 +747,15 @@ async function callExternal(judge, cfg, task) {
   const schemaPath = `${base}.schema.json`;
   writeJson(schemaPath, task.schema);
   const started = Date.now();
+  const kind = kindOf(judge);
+  const model = modelOf(cfg, judge);
+  const effort = effortOf(cfg, judge);
 
-  if (judge === 'codex') {
+  if (kind === 'codex') {
     rmSync(rawPath, { force: true });
     const args = ['exec', '-s', 'read-only', '--skip-git-repo-check', '--ephemeral', '--json', '--output-schema', schemaPath, '-o', rawPath];
-    if (cfg.models?.codex) args.push('-m', cfg.models.codex);
-    if (cfg.efforts?.codex) args.push('-c', `model_reasoning_effort="${cfg.efforts.codex}"`);
+    if (model) args.push('-m', model);
+    if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
     for (const p of task.images) args.push('-i', p);
     // No positional prompt: codex exec reads the prompt from stdin.
     const r = await run('codex', args, { input: task.prompt });
@@ -734,17 +766,17 @@ async function callExternal(judge, cfg, task) {
     return readFileSync(rawPath, 'utf8');
   }
 
-  if (judge === 'agy') {
+  if (kind === 'agy') {
     // Plan mode is read-only. The @paths in the prompt attach the screenshots.
     const args = [
       '-p', task.prompt,
       '--mode', 'plan',
       '--output-format', 'json',
       '--json-schema', schemaPath,
-      '--model', cfg.models?.agy ?? AGY_MODEL,
+      '--model', model ?? AGY_MODEL,
       '--disable-slash-commands',
     ];
-    if (cfg.efforts?.agy) args.push('--effort', cfg.efforts.agy);
+    if (effort) args.push('--effort', effort);
     const r = await run('agy', args);
     writeFileSync(rawPath, r.stdout + (r.stderr ? `\n--- stderr ---\n${r.stderr}` : ''));
     if (r.timedOut) throw new FatalError('agy timed out');
@@ -765,7 +797,7 @@ async function callExternal(judge, cfg, task) {
 
   // gemini: needs a paid GEMINI_API_KEY. --skip-trust keeps plan (read-only) mode in headless runs.
   const args = ['--skip-trust', '--approval-mode', 'plan', '-o', 'json'];
-  if (cfg.models?.gemini) args.push('-m', cfg.models.gemini);
+  if (model) args.push('-m', model);
   args.push('-p', task.prompt);
   const r = await run('gemini', args);
   writeFileSync(rawPath, r.stdout + (r.stderr ? `\n--- stderr ---\n${r.stderr}` : ''));
@@ -1361,7 +1393,7 @@ async function cmdModels(args) {
   if (!EFFORTS.includes(target)) die(`--effort must be one of ${EFFORTS.join(', ')}.`);
   const best = { models: {}, efforts: {} };
 
-  if (cfg.judges.includes('codex')) {
+  if (hasKind(cfg, 'codex')) {
     try {
       const [list] = await codexAppServer([['model/list', {}]]);
       const models = (list?.data ?? []).filter((m) => !m.hidden);
@@ -1379,7 +1411,7 @@ async function cmdModels(args) {
       console.log(`codex: could not list models (${e.message})`);
     }
   }
-  if (cfg.judges.includes('agy')) {
+  if (hasKind(cfg, 'agy')) {
     const ids = await agyModelIds();
     console.log(`\nagy models:\n${ids.map((m) => `  ${m.id.padEnd(28)} ${m.name}`).join('\n') || '  none listed. Is agy signed in?'}`);
     const { id, ties } = bestAgyModel(ids.map((m) => m.id), target);
@@ -1395,12 +1427,15 @@ async function cmdModels(args) {
   }
 
   const row = (j) => {
-    const now = `${cfg.models?.[j] ?? (j === 'claude' ? 'session model' : 'CLI default')}${cfg.efforts?.[j] ? ` @ ${cfg.efforts[j]}` : ''}`;
-    const want = best.models[j] ? `${best.models[j]}${best.efforts[j] ? ` @ ${best.efforts[j]}` : ''}` : null;
-    return `  ${j.padEnd(8)} now: ${now.padEnd(30)} best: ${want ?? '-'}`;
+    const k = kindOf(j);
+    // A model named for one judge with `judges kind=model` stays as the user set it.
+    const pinned = j !== k && cfg.models?.[j] != null;
+    const now = `${modelOf(cfg, j) ?? (k === 'claude' ? 'session model' : 'CLI default')}${effortOf(cfg, j) ? ` @ ${effortOf(cfg, j)}` : ''}`;
+    const want = pinned ? 'set by you' : best.models[k] ? `${best.models[k]}${best.efforts[k] ? ` @ ${best.efforts[k]}` : ''}` : null;
+    return `  ${padJudge(cfg, j)} now: ${now.padEnd(30)} best: ${want ?? '-'}`;
   };
   console.log(`\n${cfg.judges.map(row).join('\n')}`);
-  if (cfg.judges.includes('claude') && !claudeModel) {
+  if (!claudeModel && cfg.judges.some((j) => kindOf(j) === 'claude' && !modelOf(cfg, j))) {
     console.log('  claude: pass --claude <model> with the most capable model the Agent tool offers (for example opus).');
   }
   const changed = Object.keys(best.models).some((j) => best.models[j] !== cfg.models?.[j] || (best.efforts[j] ?? null) !== (cfg.efforts?.[j] ?? null));
@@ -1434,14 +1469,14 @@ async function codexQuota() {
 }
 
 // `agy -p /usage` reports the quota of each model group. Keep the groups this judge's model draws from.
-async function agyQuota(model) {
+async function agyQuota(models) {
   const r = await run('agy', ['-p', '/usage', '--mode', 'plan', '--output-format', 'json', '--print-timeout', '60s'], { timeoutMs: 90000 });
   const groups = extractJson(r.stdout)?.command?.data?.groups;
   if (!Array.isArray(groups)) throw new Error(tail(r.stderr || r.stdout));
-  const tokens = new Set(String(model).toLowerCase().split(/[-_.\s]+/));
+  const sets = [].concat(models).map((m) => new Set(String(m).toLowerCase().split(/[-_.\s]+/)));
   const fits = (name) => {
     const words = String(name).toLowerCase().split(/\s+/).filter(Boolean);
-    return words.length > 0 && words.every((w) => tokens.has(w));
+    return words.length > 0 && sets.some((tokens) => words.every((w) => tokens.has(w)));
   };
   const listed = (g) => (String(g.description ?? '').split(':')[1] ?? '').split(',');
   let mine = groups.filter((g) => fits(g.name) || listed(g).some(fits));
@@ -1516,8 +1551,12 @@ async function cmdQuota(args) {
   const snap = { at: new Date().toISOString(), judges: {}, errors: {} };
   if (n && existsSync(quotaPath(n))) Object.assign(snap.judges, readJson(quotaPath(n)).judges);
   const jobs = [];
-  if (cfg.judges.includes('codex')) jobs.push(['codex', () => codexQuota()]);
-  if (cfg.judges.includes('agy')) jobs.push(['agy', () => agyQuota(cfg.models?.agy ?? AGY_MODEL)]);
+  // Quota belongs to the provider account, so it is recorded once per kind, however many judges share it.
+  if (hasKind(cfg, 'codex')) jobs.push(['codex', () => codexQuota()]);
+  if (hasKind(cfg, 'agy')) {
+    const models = [...new Set(cfg.judges.filter((j) => kindOf(j) === 'agy').map((j) => modelOf(cfg, j) ?? AGY_MODEL))];
+    jobs.push(['agy', () => agyQuota(models)]);
+  }
   await Promise.all(jobs.map(async ([j, f]) => {
     try {
       snap.judges[j] = await f();
@@ -1533,9 +1572,128 @@ async function cmdQuota(args) {
   if (!existsSync(roundDir(n))) die(`round ${n} does not exist yet.`);
   writeJson(quotaPath(n), snap);
   printQuota(quotaReport(n, cfg));
-  if (cfg.judges.includes('claude') && !snap.judges.claude) {
+  if (hasKind(cfg, 'claude') && !snap.judges.claude) {
     console.log('  claude   not recorded. Add --claude "5-hour:<used>,weekly:<used>" from the usage panel.');
   }
+}
+
+// ---------- the council's judges ----------
+
+const RUNS_AS = { codex: 'Codex CLI', claude: 'Claude subagent', agy: 'Antigravity CLI', gemini: 'Gemini CLI' };
+
+// The provider behind a judge: read from its model's name, else from its kind.
+function familyOf(cfg, j) {
+  const m = String(modelOf(cfg, j) ?? '').toLowerCase();
+  if (/^(claude|opus|sonnet|haiku|fable)/.test(m)) return 'Anthropic';
+  if (/^(gpt|codex|o\d)/.test(m)) return 'OpenAI';
+  if (/^gemini/.test(m)) return 'Google';
+  return { codex: 'OpenAI', claude: 'Anthropic', agy: 'Google', gemini: 'Google' }[kindOf(j)];
+}
+
+function printJudges(cfg) {
+  const exam = examStatus(cfg);
+  console.log(`council: ${cfg.judges.length} ${cfg.judges.length === 1 ? 'judge' : 'judges'}`);
+  for (const j of cfg.judges) {
+    const k = kindOf(j);
+    const model = modelOf(cfg, j) ?? (k === 'agy' ? AGY_MODEL : k === 'claude' ? 'model not set' : 'CLI default');
+    const effort = effortOf(cfg, j);
+    const r = exam.results?.judges?.[j];
+    const taken = exam.state === 'ok' && r && r.agreement != null;
+    const examText = exam.state === 'stale' ? 'exam out of date'
+      : !taken ? 'exam not taken'
+        : `${r.fit ? 'fit' : r.fit === false ? 'UNFIT' : 'exam incomplete'}${r.sharedWith ? `, exam shared with ${r.sharedWith}` : ''}`;
+    console.log(`  ${padJudge(cfg, j)} ${RUNS_AS[k].padEnd(16)} ${`${model}${effort ? ` @ ${effort}` : ''}`.padEnd(30)} ${examText}`);
+  }
+}
+
+// What the user should know about a lineup. The lineup is theirs to choose: these are notes, not gates.
+function lineupNotes(cfg) {
+  const n = cfg.judges.length;
+  const fams = cfg.judges.map((j) => familyOf(cfg, j));
+  const distinct = [...new Set(fams)];
+  const notes = [];
+  if (n === 1) {
+    notes.push('One judge is not a council: there is no second opinion and no vote. Its word decides every round.');
+  } else if (distinct.length === 1) {
+    notes.push(`Every judge is ${distinct[0] === 'Google' ? 'a' : 'an'} ${distinct[0]} model. Judges from one provider share blind spots and agree more often, so their vote is less independent than a mixed council's.`);
+  }
+  if (n > 1 && fams.filter((f) => f === 'Anthropic').length * 2 > n) {
+    notes.push("Most judges are Claude models, the same family as the builder. A judge from another provider is the stronger check on the builder's work.");
+  }
+  if (n > 1 && n % 2 === 0) notes.push('With an even number of judges a vote can tie. A tie keeps the round.');
+  if (n > 3) notes.push('A pass needs every judge at the threshold in the same round. More judges make that harder.');
+  const twins = cfg.judges.filter((j) => twinOf(cfg, j));
+  if (twins.length) {
+    notes.push(`${twins.join(', ')} ${twins.length === 1 ? 'has' : 'have'} the same model and effort as an earlier judge. They share its taste exam, and judge every round separately, each on its own shuffled copies.`);
+  }
+  notes.push(`Each round makes ${2 * n} judge calls: one to score and one to compare, for each judge.`);
+  return notes;
+}
+
+// `judges claude=3 agy`: seat the council. A kind alone, or kind=N, seats N judges on that kind's
+// model. kind=model,model seats one judge for each model named, and keeps that model for it.
+function cmdJudges(args) {
+  const cfg = loadConfig();
+  if (!args.length) {
+    printJudges(cfg);
+    console.log(`\n${lineupNotes(cfg).map((x) => `- ${x}`).join('\n')}`);
+    return;
+  }
+  const ids = [];
+  const pins = {};
+  const unique = (base) => {
+    let id = base;
+    for (let k = 1; ids.includes(id); k++) id = `${base}-${String.fromCharCode(97 + k)}`;
+    return id;
+  };
+  for (const a of args) {
+    const eq = a.indexOf('=');
+    const named = (eq < 0 ? a : a.slice(0, eq)).toLowerCase();
+    const kind = { chatgpt: 'codex', gpt: 'codex', openai: 'codex', anthropic: 'claude', antigravity: 'agy', google: 'agy' }[named] ?? named;
+    const value = eq < 0 ? '1' : a.slice(eq + 1);
+    if (!KINDS.includes(kind)) {
+      die(`unknown kind of judge "${kind}". Kinds: codex (the Codex CLI, GPT models), claude (fresh Claude subagents), agy (the Antigravity CLI, Gemini models), gemini (the old Gemini CLI, needs a paid API key).`);
+    }
+    if (/^\d+$/.test(value)) {
+      const count = Number(value);
+      if (count < 1 || count > 9) die(`"${a}": seat 1 to 9 judges of a kind.`);
+      for (let k = 0; k < count; k++) ids.push(unique(kind));
+    } else {
+      const models = value.split(',').map((m) => m.trim()).filter(Boolean);
+      if (!models.length) die(`"${a}": give a count or model names after the "=", for example ${kind}=2.`);
+      for (const model of models) {
+        const id = unique(`${kind}-${slug(model).replace(/^-+|-+$/g, '').replace(/_/g, '-')}`);
+        ids.push(id);
+        pins[id] = model;
+      }
+    }
+  }
+  const p = join(DIR, 'config.json');
+  const file = readJson(p);
+  const had = existsSync(join(EXAM_DIR, 'results.json')) ? examStatus(cfg).state : 'none';
+  file.judges = ids;
+  // Drop the models and efforts kept for judges that left. Entries for a whole kind stay.
+  for (const key of ['models', 'efforts']) {
+    file[key] = Object.fromEntries(Object.entries(file[key] ?? {}).filter(([id]) => KINDS.includes(id) || ids.includes(id)));
+  }
+  Object.assign(file.models, pins);
+  writeJson(p, file);
+
+  const next = loadConfig();
+  printJudges(next);
+  console.log(`\n${lineupNotes(next).map((x) => `- ${x}`).join('\n')}`);
+  const todo = [];
+  if (next.judges.some((j) => kindOf(j) !== 'agy' && !modelOf(next, j))) {
+    todo.push('Run `models --apply` (with `--claude <model>` for Claude judges) to set the models and efforts that are not set.');
+  }
+  if (had !== 'none') {
+    const now = examStatus(next);
+    const untested = next.judges.filter((j) => now.results?.judges?.[j]?.agreement == null);
+    if (now.state === 'stale') todo.push('The taste exam is now out of date: retake the judge part.');
+    else if (untested.length) todo.push(`Not yet through the taste exam: ${untested.join(', ')}. Run it for them, then \`exam score\`.`);
+  }
+  todo.push('From the next tally on, every judge seated here must judge the round.');
+  console.log(`\nSaved to ${rel(p)}.\n${todo.map((x) => `- ${x}`).join('\n')}`);
 }
 
 // Serves council/ on this machine only, so the gallery opens in any browser.
@@ -1711,15 +1869,15 @@ async function runJobs(cfg, jobs) {
 
 function checkExternal(list) {
   for (const j of list) {
-    if (j === 'claude') die('the claude judge runs as fresh subagents. Use the matching `prompt` command and give its output to a subagent.');
-    if (!EXTERNAL.includes(j)) die(`unknown judge "${j}". External judges: ${EXTERNAL.join(', ')}`);
+    if (kindOf(j) === 'claude') die(`${j} runs as fresh subagents. Use the matching \`prompt\` command and give its output to a subagent.`);
+    if (!isExternal(j)) die(`unknown judge "${j}". External judges: ${EXTERNAL.join(', ')}, or one of them with a suffix.`);
   }
 }
 
 async function cmdJudge(n, names) {
   const cfg = loadConfig();
   const { unfit } = examStatus(cfg);
-  const list = names.length ? names : cfg.judges.filter((j) => EXTERNAL.includes(j) && !unfit.has(j));
+  const list = names.length ? names : cfg.judges.filter((j) => isExternal(j) && !unfit.has(j));
   checkExternal(list);
   const jobs = [];
   for (const j of list) {
@@ -1731,18 +1889,27 @@ async function cmdJudge(n, names) {
 }
 
 // Printed on stderr, so it never ends up in a prompt saved with `>`.
-const claudeHint = (cfg) =>
-  `ui-council: give this prompt to a new subagent with model ${cfg.models?.claude ?? '(the most capable the Agent tool offers)'} and effort ${cfg.efforts?.claude ?? JUDGE_EFFORT}.`;
+const claudeHint = (cfg, judge) =>
+  `ui-council: give this prompt to a new subagent with model ${modelOf(cfg, judge) ?? '(the most capable the Agent tool offers)'} and effort ${effortOf(cfg, judge) ?? JUDGE_EFFORT}.`;
 
-function cmdPrompt(n, kind = 'claude') {
+// The judge a prompt command is for: the one named, or the council's first Claude judge.
+function seated(cfg, judge) {
+  const claudes = cfg.judges.filter((j) => kindOf(j) === 'claude');
+  const j = judge ?? claudes[0];
+  if (!j) die('this council has no Claude judge. See `judges`.');
+  if (!cfg.judges.includes(j)) die(`"${j}" is not on this council. Its judges: ${cfg.judges.join(', ')}.`);
+  return j;
+}
+
+function cmdPrompt(n, kind) {
   const cfg = loadConfig();
-  const compare = kind.endsWith('-compare');
-  const judge = compare ? kind.slice(0, -'-compare'.length) : kind;
+  const compare = Boolean(kind?.endsWith('-compare'));
+  const judge = seated(cfg, compare ? kind.slice(0, -'-compare'.length) : kind);
   const task = compare ? compareTask(n, judge, cfg) : scoreTask(n, judge, cfg);
   if (!task) die(`round ${n} has no earlier accepted round with matching screens to compare with.`);
   // A new prompt means a new judgment: clear the old result so tally never reads a stale one.
   for (const f of [task.outFile, task.rawFile]) rmSync(join(roundDir(n), f), { force: true });
-  if (judge === 'claude') console.error(claudeHint(cfg));
+  if (kindOf(judge) === 'claude') console.error(claudeHint(cfg, judge));
   console.log(task.prompt);
 }
 
@@ -1834,11 +2001,11 @@ function cmdTally(n) {
   for (const r of rows) {
     const tag = r.unfit ? '  (failed the taste exam: ignored)' : '';
     if (!r.ours) {
-      console.log(`${r.judge.padEnd(8)} ${r.status}${r.error ? ` (${r.error})` : ''}${tag}`);
+      console.log(`${padJudge(cfg, r.judge)} ${r.status}${r.error ? ` (${r.error})` : ''}${tag}`);
       continue;
     }
     const ref = r.bestRef ? `best ref ${r.bestRef.name} ${fmt(r.bestRef.avg)}` : 'no refs';
-    console.log(`${r.judge.padEnd(8)} ${r.status.toUpperCase().padEnd(8)} avg ${fmt(r.ours.avg)}  weakest ${r.ours.minK} ${fmt(r.ours.min)}  ${ref}${tag}`);
+    console.log(`${padJudge(cfg, r.judge)} ${r.status.toUpperCase().padEnd(8)} avg ${fmt(r.ours.avg)}  weakest ${r.ours.minK} ${fmt(r.ours.min)}  ${ref}${tag}`);
   }
   if (ran.length) {
     console.log(`\n${'category'.padEnd(16)}${ran.map((r) => r.judge.padStart(9)).join('')}`);
@@ -1859,7 +2026,7 @@ function cmdTally(n) {
     console.log(`\ncompare with round ${base} (last accepted):`);
     for (const c of compares) {
       const what = c.status === 'ok' ? `prefers ${c.overall === 'tie' ? 'neither (tie)' : `the ${c.overall} version`}. ${c.reason}` : c.status;
-      console.log(`  ${c.judge.padEnd(8)} ${what}${c.error ? ` (${c.error})` : ''}`);
+      console.log(`  ${padJudge(cfg, c.judge)} ${what}${c.error ? ` (${c.error})` : ''}`);
     }
     console.log(`  votes: current ${votes.current}, previous ${votes.previous}, tie ${votes.tie} -> ${regression ? 'REGRESSION' : 'kept'}`);
   }
@@ -2361,16 +2528,20 @@ function loadExamResult(judge, tag) {
 async function cmdExamRun(names) {
   const cfg = loadConfig();
   loadExam();
-  const list = names.length ? names : cfg.judges.filter((j) => EXTERNAL.includes(j));
+  // Judges with the same kind, model and effort share one exam: only the first of them takes it.
+  const list = names.length ? names : cfg.judges.filter((j) => isExternal(j) && !twinOf(cfg, j));
   checkExternal(list);
   await runJobs(cfg, list.flatMap((j) => [[j, examTask(j, 1, cfg)], [j, examTask(j, 2, cfg)]]));
 }
 
-function cmdExamPrompt(judge = 'claude', pass) {
+function cmdExamPrompt(name, pass) {
   const cfg = loadConfig();
+  const judge = seated(cfg, name);
+  const twin = twinOf(cfg, judge);
+  if (twin) die(`${judge} has the same model and effort as ${twin}, so it shares that judge's exam. Run \`exam prompt ${twin} ${pass ?? 1}\` instead.`);
   const task = examTask(judge, pass, cfg);
   for (const f of [task.outFile, task.rawFile]) rmSync(examPath(f), { force: true });
-  if (judge === 'claude') console.error(claudeHint(cfg));
+  if (kindOf(judge) === 'claude') console.error(claudeHint(cfg, judge));
   console.log(task.prompt);
 }
 
@@ -2390,6 +2561,11 @@ function cmdExamScore() {
 
   const judges = {};
   for (const j of cfg.judges) {
+    const twin = twinOf(cfg, j);
+    if (twin) {
+      judges[j] = { ...judges[twin], sharedWith: twin };
+      continue;
+    }
     const passes = ['p1', 'p2'].map((tag) => {
       try {
         const r = loadExamResult(j, tag);
@@ -2462,20 +2638,21 @@ function cmdExamScore() {
   console.log(`Taste exam ${exam.id}: ${exam.items.length} pairs (${count('flaw')} flaws, ${count('tell')} AI tells, ${count('style')} made generic, ${count('history')} from past rounds).`);
   console.log(answered ? `Right answers: your ${answered} picks first, then the built-in answers.` : 'Right answers: built-in only. You have not taken the exam yet.');
   console.log(`Fit means at least ${pct(cfg.exam.minAgreement).trim()} agreement and ${pct(cfg.exam.minConsistency).trim()} consistency when pairs are swapped.\n`);
-  console.log(`${'judge'.padEnd(8)} agree  consistent  flaws   tells   generic rounds  verdict`);
+  console.log(`${padJudge(cfg, 'judge')} agree  consistent  flaws   tells   generic rounds  verdict`);
   for (const j of cfg.judges) {
     const r = judges[j];
-    const verdict = r.fit == null ? (r.note || 'unknown') : r.fit ? 'fit' : 'UNFIT: ignored by tally';
-    console.log(`${j.padEnd(8)} ${pct(r.agreement)}   ${pct(r.consistency)}        ${frac(r.byKind?.flaw).padEnd(7)} ${frac(r.byKind?.tell).padEnd(7)} ${frac(r.byKind?.style).padEnd(7)} ${frac(r.byKind?.history).padEnd(7)} ${verdict}`);
+    const verdict = `${r.fit == null ? (r.note || 'unknown') : r.fit ? 'fit' : 'UNFIT: ignored by tally'}${r.sharedWith ? ` (shares the exam of ${r.sharedWith}: same model and effort)` : ''}`;
+    console.log(`${padJudge(cfg, j)} ${pct(r.agreement)}   ${pct(r.consistency)}        ${frac(r.byKind?.flaw).padEnd(7)} ${frac(r.byKind?.tell).padEnd(7)} ${frac(r.byKind?.style).padEnd(7)} ${frac(r.byKind?.history).padEnd(7)} ${verdict}`);
   }
   // Judges start at a moderate effort. One that fails moves up a step before anything else changes.
-  for (const j of cfg.judges.filter((x) => judges[x].fit === false)) {
-    const now = j === 'agy' ? (cfg.models?.agy ?? AGY_MODEL).split('-').at(-1) : (cfg.efforts?.[j] ?? 'default');
+  for (const j of cfg.judges.filter((x) => judges[x].fit === false && !judges[x].sharedWith)) {
+    const isAgy = kindOf(j) === 'agy';
+    const now = isAgy ? (modelOf(cfg, j) ?? AGY_MODEL).split('-').at(-1) : (effortOf(cfg, j) ?? 'default');
     const up = nextEffort(now);
     console.log(
       up === now
         ? `\n${j} is unfit at its deepest effort. Try another model for it in models.${j}, then retake its part.`
-        : `\n${j} is unfit at effort ${now}. Raise it one step to ${up} (${j === 'agy' ? `the models.agy variant ending in -${up}, if agy lists one` : `efforts.${j}`}), then retake its part.`,
+        : `\n${j} is unfit at effort ${now}. Raise it one step to ${up} (${isAgy ? `the models.${j} variant ending in -${up}, if agy lists one` : `efforts.${j}`}), then retake its part.`,
     );
   }
   if (!answered) {
@@ -2697,8 +2874,8 @@ const USAGE = `usage: node council.mjs <command>   (run from the project root)
   capture <round>           screenshot every screen and theme, run the objective checks
   judge <round> [judge...]  run external judges in parallel (codex, agy, gemini):
                             blind scoring, plus comparison with the last accepted round
-  prompt <round> [kind]     print a Claude subagent prompt: claude (scoring) or
-                            claude-compare (comparison, round 2 on)
+  prompt <round> [judge]    print a Claude judge's subagent prompt: its id for scoring (claude,
+                            claude-b), or its id plus -compare for the comparison (round 2 on)
   tally <round>             scores, checks, comparison, and the NEXT step
   issues <round>            check failures, screens that got worse, judge issues, AI tells
   fixes <round> [--force]   write rounds/<round+1>/changes.json: every request from <round>,
@@ -2706,6 +2883,9 @@ const USAGE = `usage: node council.mjs <command>   (run from the project root)
   history                   scores, checks, and votes across rounds
   gallery                   write council/gallery/index.html: every round, changes marked
   serve [port]              serve council/ on 127.0.0.1 (default 8766) to view the gallery
+  judges [kind[=N]...]      show the council, or seat a new one. \`judges claude=3 agy\` seats three
+                            Claude judges and one Gemini judge. \`judges claude=opus,sonnet\` seats
+                            one Claude judge for each model named. Kinds: codex, claude, agy, gemini
   models [--apply] [--claude <model>] [--effort <level>]
                             list each judge's models; --apply saves the most capable model
                             at the judging effort (default high)
@@ -2718,7 +2898,7 @@ taste exam (checks each judge's taste against yours):
                             --trusted: the screens already carry their design language well
   exam answer <code>        save your picks (the code at the end of council/exam/index.html)
   exam run [judge...]       external judges take the exam twice, pairs swapped (codex, agy, gemini)
-  exam prompt claude <1|2>  print the Claude subagent exam prompt for pass 1 or 2
+  exam prompt <judge> <1|2> print a Claude judge's exam prompt for pass 1 or 2
   exam score                agreement and consistency per judge; unfit judges stop counting`;
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -2734,6 +2914,9 @@ switch (cmd) {
     break;
   case 'prompt':
     cmdPrompt(rest[0], rest[1]);
+    break;
+  case 'judges':
+    cmdJudges(rest);
     break;
   case 'tally':
     cmdTally(rest[0]);
