@@ -2035,7 +2035,7 @@ function loadExam() {
 }
 
 async function shoot(browser, cfg, screen, theme, file, deg) {
-  const context = await browser.newContext({
+  const context = await browser.newContext({ bypassCSP: true,
     viewport: cfg.viewport,
     colorScheme: theme === 'dark' ? 'dark' : 'light',
     storageState: cfg.storageState || undefined,
